@@ -4,6 +4,28 @@
 
 RevitMCP (Revit Model Content Protocol) is a pyRevit extension that allows external applications, such as AI assistants or other services, to interact with a running instance of Autodesk Revit. It achieves this by exposing an HTTP API from within Revit using pyRevit's "Routes" functionality. An external server component (typically `server.py` in this project) acts as an intermediary, which the external application communicates with. This intermediary server then makes calls to the API hosted by pyRevit within Revit.
 
+## Key Features
+
+- **Element Selection and Filtering:** Find and select elements by category, properties, or custom filters
+- **Project Information Access:** Retrieve project metadata and document properties  
+- **Element Parameter Management:** Read and update element parameters with type validation
+- **Sheet and View Management:** Automatically place views on new sheets with smart numbering
+- **Natural Language Integration:** Compatible with AI assistants for intuitive Revit automation
+
+## New: Sheet Placement Tool
+
+The latest feature allows you to place views onto sheets using simple commands like:
+- "Place detail foundation onto a sheet"
+- "Put section A-A on a new sheet"
+
+The tool automatically:
+- Finds views by name (fuzzy matching)
+- Creates new sheets with appropriate numbering (D001, S001, etc.)
+- Places views in the center of sheets
+- Handles titleblock selection and viewport creation
+
+See `Sheet_Placement_Tool_Documentation.md` for complete usage details.
+
 This README provides instructions on how to set up and use the `RevitMCP.extension`.
 
 ## Prerequisites

@@ -152,6 +152,10 @@ try:
     FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
     GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
     UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
+    
+    # Sheet and view management tools
+    PLACE_VIEW_ON_SHEET_TOOL_NAME = "place_view_on_sheet"
+    LIST_VIEWS_TOOL_NAME = "list_views"
 
     # Replace batch workflow with generic planner
     PLANNER_TOOL_NAME = "plan_and_execute_workflow"
@@ -405,6 +409,20 @@ try:
         
         return call_revit_listener(command_path='/elements/update_parameters', method='POST', payload_data={"updates": updates})
 
+    @mcp_server.tool(name=PLACE_VIEW_ON_SHEET_TOOL_NAME)
+    def place_view_on_sheet_mcp_tool(view_name: str, exact_match: bool = False) -> dict:
+        """Places a view on a new sheet by view name. Creates a new sheet with automatic numbering and places the view in the center. Supports fuzzy matching for view names."""
+        app.logger.info(f"MCP Tool executed: {PLACE_VIEW_ON_SHEET_TOOL_NAME} with view_name: {view_name}, exact_match: {exact_match}")
+        
+        return call_revit_listener(command_path='/sheets/place_view', method='POST', payload_data={"view_name": view_name, "exact_match": exact_match})
+
+    @mcp_server.tool(name=LIST_VIEWS_TOOL_NAME)
+    def list_views_mcp_tool() -> dict:
+        """Lists all views in the current document that can be placed on sheets. Returns view names, types, and whether they're already on sheets."""
+        app.logger.info(f"MCP Tool executed: {LIST_VIEWS_TOOL_NAME}")
+        
+        return call_revit_listener(command_path='/sheets/list_views', method='GET')
+
     @mcp_server.tool(name=PLANNER_TOOL_NAME)
     def plan_and_execute_workflow_tool(user_request: str, execution_plan: list[dict]) -> dict:
         """
@@ -451,7 +469,12 @@ try:
             "select_stored_elements": lambda **kwargs: select_stored_elements_mcp_tool(
                 kwargs.get("category_name")
             ),
-            "list_stored_elements": list_stored_elements_mcp_tool
+            "list_stored_elements": list_stored_elements_mcp_tool,
+            "place_view_on_sheet": lambda **kwargs: place_view_on_sheet_mcp_tool(
+                kwargs.get("view_name"), 
+                kwargs.get("exact_match", False)
+            ),
+            "list_views": list_views_mcp_tool
         }
         
         try:
@@ -648,6 +671,20 @@ try:
         },
         "required": ["updates"]
     }
+    # Sheet and view management tool descriptions and parameters
+    PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM = "Places a view onto a new sheet by view name. Creates a new sheet with automatic numbering based on view type (D001 for details, S001 for sections, P001 for floor plans, etc.) and places the view in the center of the sheet. Supports fuzzy matching for view names when exact_match=False."
+    PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM = {
+        "type": "object",
+        "properties": {
+            "view_name": {"type": "string", "description": "Name of the view to place on the sheet. Can be partial name if exact_match=False"},
+            "exact_match": {"type": "boolean", "description": "Whether to require exact view name match (default: False for fuzzy matching)"}
+        },
+        "required": ["view_name"]
+    }
+    
+    LIST_VIEWS_TOOL_DESCRIPTION_FOR_LLM = "Lists all views in the current Revit document that can be placed on sheets. Returns view names, types, IDs, and whether they're already placed on sheets. Use this to discover available views before placing them."
+    LIST_VIEWS_TOOL_PARAMETERS_FOR_LLM = {"type": "object", "properties": {}}
+
     PLANNER_TOOL_DESCRIPTION_FOR_LLM = "Executes a sequence of tools based on a planned workflow. The LLM should first analyze the user request, then provide a step-by-step execution plan."
     PLANNER_TOOL_PARAMETERS_FOR_LLM = {
         "type": "object",
@@ -680,6 +717,8 @@ try:
             {"type": "function", "function": {"name": FILTER_ELEMENTS_TOOL_NAME, "description": FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "parameters": FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": GET_ELEMENT_PROPERTIES_TOOL_NAME, "description": GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, "parameters": GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, "description": UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, "parameters": UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM}},
+            {"type": "function", "function": {"name": PLACE_VIEW_ON_SHEET_TOOL_NAME, "description": PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, "parameters": PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM}},
+            {"type": "function", "function": {"name": LIST_VIEWS_TOOL_NAME, "description": LIST_VIEWS_TOOL_DESCRIPTION_FOR_LLM, "parameters": LIST_VIEWS_TOOL_PARAMETERS_FOR_LLM}},
             {"type": "function", "function": {"name": PLANNER_TOOL_NAME, "description": PLANNER_TOOL_DESCRIPTION_FOR_LLM, "parameters": PLANNER_TOOL_PARAMETERS_FOR_LLM}},
         ],
         "anthropic": [
@@ -691,6 +730,8 @@ try:
             {"name": FILTER_ELEMENTS_TOOL_NAME, "description": FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM},
             {"name": GET_ELEMENT_PROPERTIES_TOOL_NAME, "description": GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, "input_schema": GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM},
             {"name": UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, "description": UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM},
+            {"name": PLACE_VIEW_ON_SHEET_TOOL_NAME, "description": PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, "input_schema": PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM},
+            {"name": LIST_VIEWS_TOOL_NAME, "description": LIST_VIEWS_TOOL_DESCRIPTION_FOR_LLM, "input_schema": LIST_VIEWS_TOOL_PARAMETERS_FOR_LLM},
             {"name": PLANNER_TOOL_NAME, "description": PLANNER_TOOL_DESCRIPTION_FOR_LLM, "input_schema": PLANNER_TOOL_PARAMETERS_FOR_LLM},
         ],
         "google": [
@@ -703,6 +744,8 @@ try:
                 google_types.FunctionDeclaration(name=FILTER_ELEMENTS_TOOL_NAME, description=FILTER_ELEMENTS_TOOL_DESCRIPTION_FOR_LLM, parameters=FILTER_ELEMENTS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=GET_ELEMENT_PROPERTIES_TOOL_NAME, description=GET_ELEMENT_PROPERTIES_TOOL_DESCRIPTION_FOR_LLM, parameters=GET_ELEMENT_PROPERTIES_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME, description=UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM, parameters=UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM),
+                google_types.FunctionDeclaration(name=PLACE_VIEW_ON_SHEET_TOOL_NAME, description=PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM, parameters=PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM),
+                google_types.FunctionDeclaration(name=LIST_VIEWS_TOOL_NAME, description=LIST_VIEWS_TOOL_DESCRIPTION_FOR_LLM, parameters=LIST_VIEWS_TOOL_PARAMETERS_FOR_LLM),
                 google_types.FunctionDeclaration(name=PLANNER_TOOL_NAME, description=PLANNER_TOOL_DESCRIPTION_FOR_LLM, parameters=PLANNER_TOOL_PARAMETERS_FOR_LLM),
             ])
         ]
@@ -756,6 +799,8 @@ AVAILABLE TOOLS FOR PLANNING:
 - select_elements_by_id: Select specific elements (params: element_ids)
 - select_stored_elements: Select stored elements (params: category_name)
 - list_stored_elements: List available stored categories (no params)
+- place_view_on_sheet: Place view on new sheet (params: view_name, exact_match)
+- list_views: List all available views (no params)
 
 EXECUTION PLAN FORMAT:
 [
@@ -827,6 +872,10 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
                                 tool_result_data = get_element_properties_mcp_tool(element_ids=function_args.get("element_ids", []), parameter_names=function_args.get("parameter_names", []))
                             elif function_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
                                 tool_result_data = update_element_parameters_mcp_tool(updates=function_args.get("updates", []))
+                            elif function_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
+                                tool_result_data = place_view_on_sheet_mcp_tool(view_name=function_args.get("view_name"), exact_match=function_args.get("exact_match", False))
+                            elif function_name == LIST_VIEWS_TOOL_NAME:
+                                tool_result_data = list_views_mcp_tool()
                             elif function_name == PLANNER_TOOL_NAME:
                                 tool_result_data = plan_and_execute_workflow_tool(
                                     user_request=function_args.get("user_request"),
@@ -892,6 +941,10 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
                                 tool_result_data = get_element_properties_mcp_tool(element_ids=tool_input.get("element_ids", []), parameter_names=tool_input.get("parameter_names", []))
                             elif tool_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
                                 tool_result_data = update_element_parameters_mcp_tool(updates=tool_input.get("updates", []))
+                            elif tool_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
+                                tool_result_data = place_view_on_sheet_mcp_tool(view_name=tool_input.get("view_name"), exact_match=tool_input.get("exact_match", False))
+                            elif tool_name == LIST_VIEWS_TOOL_NAME:
+                                tool_result_data = list_views_mcp_tool()
                             elif tool_name == PLANNER_TOOL_NAME:
                                 tool_result_data = plan_and_execute_workflow_tool(
                                     user_request=tool_input.get("user_request"),
@@ -972,6 +1025,10 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
                         tool_result_data = get_element_properties_mcp_tool(element_ids=function_args.get("element_ids", []), parameter_names=function_args.get("parameter_names", []))
                     elif function_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
                         tool_result_data = update_element_parameters_mcp_tool(updates=function_args.get("updates", []))
+                    elif function_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
+                        tool_result_data = place_view_on_sheet_mcp_tool(view_name=function_args.get("view_name"), exact_match=function_args.get("exact_match", False))
+                    elif function_name == LIST_VIEWS_TOOL_NAME:
+                        tool_result_data = list_views_mcp_tool()
                     elif function_name == PLANNER_TOOL_NAME:
                         tool_result_data = plan_and_execute_workflow_tool(
                             user_request=function_args.get("user_request"),
