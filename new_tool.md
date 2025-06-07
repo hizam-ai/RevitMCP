@@ -1,4 +1,16 @@
-# RevitMCP New Tool Creation Guide
+INFO [Starting RevitMCP] RevitMCP.extension startup script executing... 
+
+INFO [Starting RevitMCP] pyRevit routes API 'revit-mcp-v1' initialized in startup.py. 
+
+INFO [Starting RevitMCP] Route /project_info for API 'revit-mcp-v1' defined in startup.py. 
+
+INFO [Starting RevitMCP] Route /elements/by_category for API 'revit-mcp-v1' defined in startup.py. 
+
+INFO [Starting RevitMCP] Route /select_elements_by_category for API 'revit-mcp-v1' defined in startup.py. 
+
+INFO [Starting RevitMCP] Route /highlight_elements_by_id for API 'revit-mcp-v1' defined in startup.py. 
+
+INFO [Starting RevitMCP] RevitMCP.extension startup script finished. # RevitMCP New Tool Creation Guide
 
 ## Overview
 This guide explains how to create new tools for RevitMCP and properly interface with the Revit API through pyRevit routes.

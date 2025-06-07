@@ -15,14 +15,19 @@ try:
         ViewFamilyType,
         ViewType,
         BuiltInCategory,
-        Transaction,
         ElementId,
         Viewport,
         XYZ,
         BoundingBoxUV,
-        UV
+        UV,
+        Transaction
     )
     from Autodesk.Revit.Creation import Application
+    from Autodesk.Revit.UI import UIApplication
+    # Import pyRevit DB for transaction handling
+    from pyrevit import DB
+    from pyrevit import revit, script
+    import System
     REVIT_API_AVAILABLE = True
 except ImportError:
     print("ERROR (sheet_placement_tool): Revit API modules not found. This script must run in Revit.")
@@ -36,12 +41,18 @@ except ImportError:
     ViewFamilyType = None
     ViewType = None
     BuiltInCategory = None
-    Transaction = None
     ElementId = None
     Viewport = None
     XYZ = None
     BoundingBoxUV = None
     UV = None
+    # Placeholder for DB
+    class DB:
+        class Transaction:
+            def __init__(self, doc, name): pass
+            def Start(self): pass
+            def Commit(self): pass
+            def RollBack(self): pass
 
 
 def find_views_by_name(doc, view_name, logger, exact_match=False):
@@ -326,123 +337,109 @@ def get_view_type_name(view, logger):
 
 def place_view_on_new_sheet(doc, view_name, logger, exact_match=False):
     """
-    Main function to find a view by name and place it on a new sheet.
-    
-    Args:
-        doc: Revit Document
-        view_name (str): Name of the view to place
-        logger: Logger instance
-        exact_match (bool): Whether to require exact name match
-    
-    Returns:
-        dict: Result dictionary with status and details
+    Create a new sheet and place the specified view on it.
+    This version uses standard Revit API Transaction for external event context.
     """
     if not REVIT_API_AVAILABLE:
         return {"status": "error", "message": "Revit API not available"}
     
     try:
-        # Find matching views
-        matching_views = find_views_by_name(doc, view_name, logger, exact_match)
+        logger.info("Starting sheet creation for view: '{}'".format(view_name))
         
-        if not matching_views:
-            return {
-                "status": "error",
-                "message": "No views found matching '{}'".format(view_name),
-                "view_name": view_name
-            }
+        # Find the view
+        all_views = FilteredElementCollector(doc).OfClass(View).WhereElementIsNotElementType().ToElements()
+        target_view = None
         
-        if len(matching_views) > 1 and exact_match:
-            # Multiple exact matches shouldn't happen, but handle it
-            return {
-                "status": "error",
-                "message": "Multiple exact matches found for '{}'. This shouldn't happen.".format(view_name),
-                "view_name": view_name,
-                "matching_views": [v.Name for v in matching_views]
-            }
+        for view in all_views:
+            if hasattr(view, 'Name') and view.Name:
+                if exact_match:
+                    if view.Name == view_name:
+                        target_view = view
+                        break
+                else:
+                    if view_name.lower() in view.Name.lower():
+                        target_view = view
+                        break
         
-        if len(matching_views) > 1:
-            # Multiple fuzzy matches - let user know
-            return {
-                "status": "multiple_matches",
-                "message": "Multiple views found matching '{}'. Please be more specific.".format(view_name),
-                "view_name": view_name,
-                "matching_views": [{"name": v.Name, "type": get_view_type_name(v, logger), "id": str(v.Id.IntegerValue)} for v in matching_views]
-            }
+        if not target_view:
+            logger.error("View '{}' not found".format(view_name))
+            return {"status": "error", "message": "View '{}' not found".format(view_name)}
         
-        # Single view found - proceed with placement
-        view_to_place = matching_views[0]
-        view_type_name = get_view_type_name(view_to_place, logger)
+        logger.info("Found view: '{}' (ID: {})".format(target_view.Name, target_view.Id))
         
-        # Get available titleblocks
-        titleblocks = get_titleblock_family_symbols(doc, logger)
+        # Check if view can be placed on sheet
+        if not hasattr(target_view, 'CanBePlacedOnSheet') or not target_view.CanBePlacedOnSheet:
+            logger.error("View '{}' cannot be placed on sheet".format(view_name))
+            return {"status": "error", "message": "View '{}' cannot be placed on sheet".format(view_name)}
+        
+        # Find a titleblock family symbol
+        titleblocks = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_TitleBlocks).WhereElementIsElementType().ToElements()
+        
         if not titleblocks:
-            return {
-                "status": "error",
-                "message": "No titleblock family symbols found. Cannot create sheet.",
-                "view_name": view_name
-            }
+            logger.error("No titleblock family found in project")
+            return {"status": "error", "message": "No titleblock family found in project"}
         
-        # Use the first available titleblock
         titleblock = titleblocks[0]
+        logger.info("Using titleblock: '{}'".format(titleblock.Name))
         
-        # Generate sheet number and name
-        sheet_number = find_next_sheet_number(doc, view_type_name, logger)
-        sheet_name = "{} - {}".format(view_type_name, view_to_place.Name)
+        # Use standard Revit API Transaction (we're in external event context)
+        t = Transaction(doc, "Create Sheet and Place View")
         
-        # Start transaction for sheet creation and view placement
-        with Transaction(doc, "Place View on New Sheet") as t:
+        try:
+            logger.info("Starting transaction...")
             t.Start()
             
-            try:
-                # Create the sheet
-                new_sheet = create_new_sheet(doc, sheet_number, sheet_name, titleblock, logger)
-                if not new_sheet:
-                    t.RollBack()
-                    return {
-                        "status": "error",
-                        "message": "Failed to create new sheet",
-                        "view_name": view_name
-                    }
-                
-                # Calculate center point for viewport placement
-                center_point = get_sheet_center_point(new_sheet, logger)
-                
-                # Place the view on the sheet
-                viewport = place_view_on_sheet(doc, view_to_place, new_sheet, center_point, logger)
-                if not viewport:
-                    t.RollBack()
-                    return {
-                        "status": "error",
-                        "message": "Failed to place view '{}' on sheet".format(view_to_place.Name),
-                        "view_name": view_name
-                    }
-                
-                # Commit the transaction
-                t.Commit()
-                
-                return {
-                    "status": "success",
-                    "message": "Successfully placed view '{}' on new sheet '{}'".format(view_to_place.Name, sheet_number),
-                    "view_name": view_to_place.Name,
-                    "view_type": view_type_name,
-                    "sheet_number": sheet_number,
-                    "sheet_name": sheet_name,
-                    "sheet_id": str(new_sheet.Id.IntegerValue),
-                    "viewport_id": str(viewport.Id.IntegerValue),
-                    "titleblock_used": titleblock.Family.Name
-                }
-                
-            except Exception as transaction_error:
+            # Create the sheet
+            new_sheet = ViewSheet.Create(doc, titleblock.Id)
+            logger.info("Created sheet with ID: {}".format(new_sheet.Id))
+            
+            # Set sheet name and number
+            sheet_number = "S-{:03d}".format(new_sheet.Id.IntegerValue % 1000)
+            sheet_name = "Sheet for {}".format(target_view.Name)
+            
+            new_sheet.SheetNumber = sheet_number
+            new_sheet.Name = sheet_name
+            
+            logger.info("Set sheet number: '{}', name: '{}'".format(sheet_number, sheet_name))
+            
+            # Place the view on the sheet at center
+            sheet_center = XYZ(0, 0, 0)  # This will be adjusted by Revit automatically
+            
+            logger.info("Placing view on sheet...")
+            viewport = Viewport.Create(doc, new_sheet.Id, target_view.Id, sheet_center)
+            
+            logger.info("View placed successfully. Viewport ID: {}".format(viewport.Id))
+            
+            # Commit the transaction
+            logger.info("Committing transaction...")
+            t.Commit()
+            
+            logger.info("Sheet creation completed successfully!")
+            
+            return {
+                "status": "success",
+                "message": "Successfully created sheet '{}' with view '{}'".format(sheet_number, target_view.Name),
+                "sheet_id": str(new_sheet.Id),
+                "sheet_number": sheet_number,
+                "sheet_name": sheet_name,
+                "view_name": target_view.Name,
+                "viewport_id": str(viewport.Id)
+            }
+            
+        except Exception as e:
+            logger.error("Transaction error: {}".format(e), exc_info=True)
+            if t.HasStarted():
                 t.RollBack()
-                logger.error("SheetPlacementTool: Transaction failed: {}".format(transaction_error), exc_info=True)
-                return {
-                    "status": "error",
-                    "message": "Transaction failed: {}".format(str(transaction_error)),
-                    "view_name": view_name
-                }
-        
+                logger.info("Transaction rolled back")
+            
+            return {
+                "status": "error",
+                "message": "Failed to create sheet: {}".format(str(e)),
+                "view_name": view_name
+            }
+            
     except Exception as e:
-        logger.error("SheetPlacementTool: Error in place_view_on_new_sheet: {}".format(e), exc_info=True)
+        logger.error("Sheet creation error: {}".format(e), exc_info=True)
         return {
             "status": "error",
             "message": "Unexpected error: {}".format(str(e)),

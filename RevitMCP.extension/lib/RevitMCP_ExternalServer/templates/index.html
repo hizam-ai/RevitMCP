@@ -505,6 +505,7 @@
     </div>
 
     <script>
+    document.addEventListener('DOMContentLoaded', function() {
         const messageLog = document.getElementById('message-log');
         const messageInput = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
@@ -530,6 +531,119 @@
         let currentConversation = [];
         let allChats = {};
         let activeChatId = null;
+
+        function addMessageToLog(sender, message, isStreaming = false) {
+            // If streaming, find the last bot message with "..." and update it.
+            if (isStreaming) {
+                const lastBotMessage = messageLog.querySelector('.bot-message:last-child');
+                if (lastBotMessage && lastBotMessage.innerHTML.endsWith('...')) {
+                    lastBotMessage.innerHTML = marked.parse(message); // Use marked to parse markdown
+                    messageLog.scrollTop = messageLog.scrollHeight;
+                    return;
+                }
+            }
+            
+            // Otherwise, create a new message element.
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', sender === 'user' ? 'user-message' : 'bot-message');
+            messageDiv.innerHTML = marked.parse(message); // Use marked to parse markdown
+            messageLog.appendChild(messageDiv);
+            messageLog.scrollTop = messageLog.scrollHeight;
+        }
+
+        // --- WebSocket Communication ---
+        let socket;
+        const mcp_port = 8001;
+        const ws_url = `ws://localhost:${mcp_port}/mcp`;
+
+        function connectWebSocket() {
+            console.log("Attempting to connect to WebSocket at:", ws_url);
+            socket = new WebSocket(ws_url);
+
+            socket.onopen = function(event) {
+                console.log("WebSocket connection established.");
+                addMessageToLog('bot', 'Connected to RevitMCP. Ready for commands.');
+            };
+
+            socket.onmessage = function(event) {
+                console.log("WebSocket message received:", event.data);
+                const data = JSON.parse(event.data);
+
+                let botResponseText = "Could not parse response.";
+                if (data.error) {
+                    botResponseText = `**Error:** ${data.error.message}`;
+                } else if (data.result && data.result.content && data.result.content[0].type === 'text') {
+                    const toolResult = JSON.parse(data.result.content[0].text);
+                    botResponseText = `\`\`\`json\n${JSON.stringify(toolResult, null, 2)}\n\`\`\``;
+                }
+                
+                // Update the "..." message with the final response.
+                const lastBotMessage = messageLog.querySelector('.bot-message:last-child');
+                if (lastBotMessage && lastBotMessage.innerHTML.includes('...')) {
+                    lastBotMessage.innerHTML = marked.parse(botResponseText);
+                    messageLog.scrollTop = messageLog.scrollHeight;
+                } else {
+                    addMessageToLog('bot', botResponseText);
+                }
+            };
+
+            socket.onclose = function(event) {
+                console.log("WebSocket connection closed. Attempting to reconnect...");
+                addMessageToLog('bot', 'Connection lost. Trying to reconnect...');
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            socket.onerror = function(error) {
+                console.error("WebSocket error:", error);
+                addMessageToLog('bot', '**Error:** Could not connect to the WebSocket server.');
+            };
+        }
+
+        function sendMessage(message) {
+            addMessageToLog('user', message);
+            messageInput.value = '';
+            
+            addMessageToLog('bot', 'Thinking...'); // Show a "thinking" message
+
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                console.error("WebSocket is not connected.");
+                addMessageToLog('bot', 'Error: Not connected to the server. Please ensure the RevitMCP server is running and reload the page.', true);
+                return;
+            }
+
+            const request = {
+                jsonrpc: "2.0",
+                method: "tools/call",
+                params: {
+                    name: message.toLowerCase().includes("list") ? "list_views" : "place_view_on_sheet",
+                    arguments: message.toLowerCase().includes("list") ? {} : { view_name: message }
+                },
+                id: `msg_${new Date().getTime()}`
+            };
+            
+            console.log("Sending MCP request:", request);
+            socket.send(JSON.stringify(request));
+        }
+
+        // --- Event Listeners and Initialization ---
+        sendButton.addEventListener('click', () => {
+            const message = messageInput.value.trim();
+            if (message) {
+                sendMessage(message);
+            }
+        });
+
+        messageInput.addEventListener('keypress', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const message = messageInput.value.trim();
+                if (message) {
+                    sendMessage(message);
+                }
+            }
+        });
+
+        connectWebSocket();
 
         // Wrap dependent initializations in DOMContentLoaded
         document.addEventListener('DOMContentLoaded', () => {
@@ -845,116 +959,6 @@
             }
         }
 
-        async function sendMessage() {
-            const messageText = messageInput.value.trim();
-            if (!messageText) return;
-
-            displayMessage('user', messageText);
-            
-            const selectedModelValue = modelSelector.value;
-            let apiKeyToUse = getApiKeyForModel(selectedModelValue); // Use existing helper
-
-            // No longer need special parsing for /get_view, LLM handles it.
-            
-            const payload = {
-                conversation: [...currentConversation], // currentConversation includes the new user message from displayMessage
-                model: selectedModelValue,
-                apiKey: apiKeyToUse // This will be the specific key for the selected model's provider
-            };
-            
-            messageInput.value = '';
-            statusDiv.textContent = 'Sending...';
-
-            try {
-                const response = await fetch('/chat_api', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-                }
-
-                const data = await response.json();
-
-                // Display the main text reply from the LLM
-                if (data.reply) {
-                    displayMessage('bot', data.reply);
-                }
-
-                // Check if there's an image to display alongside the text reply
-                if (data.image_output && data.image_output.status === 'success') {
-                    displayImageOutput(data.image_output.image_data, data.image_output.content_type);
-                } else if (data.image_output && data.image_output.status === 'error') {
-                    // Optionally display a specific error if the image tool failed but LLM still replied
-                    console.warn("Image tool failed:", data.image_output.message);
-                    // You could display a small error message here too if desired, e.g.:
-                    // displayMessage('bot', `(Note: Could not retrieve image - ${data.image_output.message})`, false);
-                }
-
-                // Handle other tool_output or tool_error types if they are sent outside of image_output
-                // (This part might be less relevant if all tool interactions are now summarized by the LLM in data.reply)
-                if (data.reply_type === 'tool_output' && (!data.image_output || data.image_output.tool_name !== 'get_revit_view')) {
-                    displayToolOutput(data.data, data.tool_name || 'Tool'); 
-                } else if (data.reply_type === 'tool_error') {
-                    // This might be redundant if LLM incorporates tool errors into its main reply
-                    displayMessage('bot', `Tool Error (${data.tool_name || 'Unknown Tool'}): ${data.error || 'Unknown error'}`);
-                }
-
-                statusDiv.textContent = 'Ready';
-
-            } catch (error) {
-                console.error('Error sending message:', error);
-                displayMessage('bot', `Error: ${error.message}`);
-                statusDiv.textContent = `Error: ${error.message.substring(0,100)}`;
-            }
-        }
-
-        function displayImageOutput(imageData, contentType) {
-            const messageDiv = document.createElement('div');
-            messageDiv.classList.add('message', 'bot-message', 'image-output-message');
-
-            const img = document.createElement('img');
-            img.src = `data:${contentType};base64,${imageData}`;
-            img.alt = "Revit View Export";
-            img.style.maxWidth = '100%';
-            img.style.maxHeight = '500px'; // Limit image height
-            img.style.borderRadius = '8px';
-
-            messageDiv.appendChild(img);
-            messageLog.appendChild(messageDiv);
-            messageLog.scrollTop = messageLog.scrollHeight;
-
-            // Optionally save a placeholder or info about the image to conversation history
-            // currentConversation.push({ role: 'assistant', type: 'image_response', tool_name: 'get_revit_view', content: `Displayed image: ${contentType}` });
-            // saveCurrentChat();
-        }
-
-        function displayToolOutput(toolData, toolName) { // Modified to accept toolName
-            const messageDiv = document.createElement('div');
-            messageDiv.classList.add('message', 'bot-message', 'tool-output-message');
-            messageDiv.textContent = `Tool Output (${toolName || 'Tool'}): ${toolData || 'No output'}`;
-            messageLog.appendChild(messageDiv);
-            messageLog.scrollTop = messageLog.scrollHeight;
-        }
-
-        // Event listeners for UI elements (can be set up outside DOMContentLoaded as elements exist)
-        sendButton.addEventListener('click', sendMessage);
-        messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendMessage();
-            }
-        });
-        // newChatButton.addEventListener('click', startNewChat); // Old button listener removed
-        
-        // Event listener for model selector (can be outside DOMContentLoaded)
-        modelSelector.addEventListener('change', () => {
-            localStorage.setItem('revitMCPselectedModel', modelSelector.value);
-        });
-
         function renameChat(chatId) {
             const chatToRename = allChats[chatId];
             if (!chatToRename) return;
@@ -1018,6 +1022,7 @@
             return ''; 
         }
 
+    });
     </script>
 </body>
 </html> 
