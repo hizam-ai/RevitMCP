@@ -86,6 +86,8 @@ try:
     # This stores element IDs from searches so they can be accurately referenced later
     element_storage = {}  # Format: {"category_name": {"element_ids": [...], "count": N, "timestamp": "..."}}
     
+    MAX_ELEMENTS_FOR_SELECTION = 250
+
     def store_elements(category_name: str, element_ids: list, count: int) -> str:
         """Store element IDs for a category and return a storage key."""
         import datetime
@@ -115,7 +117,7 @@ try:
     # --- Revit MCP API Communication ---
     # Auto-detect which port the Revit MCP API is running on
     REVIT_MCP_API_BASE_URL = None
-    POSSIBLE_PORTS = [48884, 48885, 48886]  # Common ports used by pyRevit
+    POSSIBLE_PORTS = [48885, 48884, 48886]  # Common ports used by pyRevit
 
     def detect_revit_mcp_port():
         """Detect which port the Revit MCP API is running on by trying common ports."""
@@ -334,11 +336,23 @@ try:
         
         # Use the stored element IDs
         element_ids = stored_data["element_ids"]
-        app.logger.info(f"Using {len(element_ids)} stored element IDs for category '{category_name}' (matched to stored key)")
-        
+        total_elements = len(element_ids)
+        app.logger.info(f"Using {total_elements} stored element IDs for category '{category_name}' (matched to stored key)")
+
+        if total_elements > MAX_ELEMENTS_FOR_SELECTION:
+            app.logger.warning("Selection aborted: %s elements exceeds safe limit of %s", total_elements, MAX_ELEMENTS_FOR_SELECTION)
+            return {
+                "status": "limit_exceeded",
+                "message": f"Selection would include {total_elements} elements which exceeds the safe limit of {MAX_ELEMENTS_FOR_SELECTION}.",
+                "suggestion": "Please narrow your criteria (e.g., filter by level or parameter) before selecting.",
+                "stored_count": stored_data.get("count", total_elements),
+                "stored_key": stored_data.get("category", category_name),
+                "selection_limit": MAX_ELEMENTS_FOR_SELECTION
+            }
+
         # Use the focused selection approach - just select and keep selected
         result = call_revit_listener(command_path='/select_elements_focused', method='POST', payload_data={"element_ids": element_ids})
-        
+
         # Add storage info to the result
         if result.get("status") == "success":
             result["source"] = f"stored_{category_name}"
@@ -346,7 +360,7 @@ try:
             result["stored_at"] = stored_data["timestamp"]
             result["matched_key"] = stored_data.get("category", "unknown")
             result["approach_note"] = "Focused selection - elements should remain active for user operations"
-        
+
         return result
 
     @mcp_server.tool(name=LIST_STORED_ELEMENTS_TOOL_NAME)
@@ -403,12 +417,56 @@ try:
         return call_revit_listener(command_path='/elements/get_properties', method='POST', payload_data=payload)
 
     @mcp_server.tool(name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME)
-    def update_element_parameters_mcp_tool(updates: list[dict]) -> dict:
-        """Updates parameter values for elements. Each update should contain element_id and parameters dict with parameter names and new values."""
-        app.logger.info(f"MCP Tool executed: {UPDATE_ELEMENT_PARAMETERS_TOOL_NAME} with {len(updates)} updates")
-        
-        return call_revit_listener(command_path='/elements/update_parameters', method='POST', payload_data={"updates": updates})
+    def update_element_parameters_mcp_tool(
+        updates: list[dict] = None,
+        element_ids: list[str] = None,
+        parameter_name: str = None,
+        new_value: str = None
+    ) -> dict:
+        """Updates parameter values for elements. Accepts either a detailed updates list or a simplified bulk form."""
+        app.logger.info(f"MCP Tool executed: {UPDATE_ELEMENT_PARAMETERS_TOOL_NAME}")
 
+        normalized_updates: list[dict] = []
+
+        if updates:
+            if not isinstance(updates, list) or not updates:
+                return {"status": "error", "message": "'updates' must be a non-empty list of update payloads."}
+
+            for update in updates:
+                if not isinstance(update, dict):
+                    return {"status": "error", "message": "Each update must be an object with element_id and parameters."}
+                element_id = str(update.get('element_id', '')).strip()
+                parameters = update.get('parameters')
+                if not element_id or not parameters:
+                    return {"status": "error", "message": "Each update requires element_id and parameters."}
+                if not isinstance(parameters, dict) or not parameters:
+                    return {"status": "error", "message": "'parameters' must be a non-empty object of parameter/value pairs."}
+                normalized_updates.append({"element_id": element_id, "parameters": parameters})
+
+        elif element_ids and parameter_name and new_value is not None:
+            if not isinstance(element_ids, list) or not element_ids:
+                return {"status": "error", "message": "'element_ids' must be a non-empty list when using the simplified form."}
+            parameter_name = str(parameter_name).strip()
+            if not parameter_name:
+                return {"status": "error", "message": "parameter_name cannot be empty."}
+            normalized_value = str(new_value)
+            for eid in element_ids:
+                element_id = str(eid).strip()
+                if not element_id:
+                    return {"status": "error", "message": "All element_ids must be non-empty strings."}
+                normalized_updates.append({"element_id": element_id, "parameters": {parameter_name: normalized_value}})
+        else:
+            return {"status": "error", "message": "Provide either 'updates' or (element_ids, parameter_name, new_value)."}
+
+        app.logger.info(f"Prepared {len(normalized_updates)} parameter update(s) for execution.")
+
+        return call_revit_listener(
+            command_path='/elements/update_parameters',
+            method='POST',
+            payload_data={"updates": normalized_updates}
+        )
+
+    
     @mcp_server.tool(name=PLACE_VIEW_ON_SHEET_TOOL_NAME)
     def place_view_on_sheet_mcp_tool(view_name: str, exact_match: bool = False) -> dict:
         """Places a view on a new sheet by view name. Creates a new sheet with automatic numbering and places the view in the center. Supports fuzzy matching for view names."""
@@ -461,7 +519,10 @@ try:
                 kwargs.get("parameter_names", [])
             ),
             "update_element_parameters": lambda **kwargs: update_element_parameters_mcp_tool(
-                kwargs.get("updates", [])
+                updates=kwargs.get("updates"),
+                element_ids=kwargs.get("element_ids"),
+                parameter_name=kwargs.get("parameter_name"),
+                new_value=kwargs.get("new_value")
             ),
             "select_elements_by_id": lambda **kwargs: select_elements_by_id_mcp_tool(
                 kwargs.get("element_ids", [])
@@ -649,7 +710,7 @@ try:
         },
         "required": ["element_ids"]
     }
-    UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM = "Updates parameter values for elements. Use this to modify element properties like sill height, dimensions, comments, etc. Always use this within a transaction context. IMPORTANT: This is typically the final step in an update workflow. When user requests parameter updates, chain: filter_elements -> get_element_properties -> update_element_parameters -> select_stored_elements in one conversation turn."
+    UPDATE_ELEMENT_PARAMETERS_TOOL_DESCRIPTION_FOR_LLM = "Updates parameter values for elements. Use this to modify element properties like sill height, dimensions, comments, etc. You can either provide a detailed updates list or use the simplified form (element_ids + parameter_name + new_value) to push the same value to many elements. Always use this within a transaction context. IMPORTANT: This is typically the final step in an update workflow. When user requests parameter updates, chain: filter_elements -> get_element_properties -> update_element_parameters -> select_stored_elements in one conversation turn."
     UPDATE_ELEMENT_PARAMETERS_TOOL_PARAMETERS_FOR_LLM = {
         "type": "object",
         "properties": {
@@ -661,16 +722,21 @@ try:
                         "element_id": {"type": "string", "description": "Element ID to update"},
                         "parameters": {
                             "type": "object",
-                            "description": "Object with parameter names as keys and new values as values (e.g., {'Sill Height': '2\\' 6\\\"', 'Comments': 'Updated'})"
+                            "description": "Object with parameter names as keys and new values as values (e.g., {'Sill Height': '2\' 6\"', 'Comments': 'Updated'})"
                         }
                     },
                     "required": ["element_id", "parameters"]
                 },
                 "description": "Array of element updates"
-            }
+            },
+            "element_ids": {"type": "array", "items": {"type": "string"}, "description": "Element IDs to update when using the simplified bulk update form"},
+            "parameter_name": {"type": "string", "description": "Parameter name to set (e.g., 'Install Level')"},
+            "new_value": {"type": "string", "description": "New value to apply to the specified parameter"}
         },
-        "required": ["updates"]
+        "description": "Provide either a detailed 'updates' array or element_ids + parameter_name + new_value for bulk updates."
     }
+
+
     # Sheet and view management tool descriptions and parameters
     PLACE_VIEW_ON_SHEET_TOOL_DESCRIPTION_FOR_LLM = "Places a view onto a new sheet by view name. Creates a new sheet with automatic numbering based on view type (D001 for details, S001 for sections, P001 for floor plans, etc.) and places the view in the center of the sheet. Supports fuzzy matching for view names when exact_match=False."
     PLACE_VIEW_ON_SHEET_TOOL_PARAMETERS_FOR_LLM = {
@@ -795,7 +861,7 @@ AVAILABLE TOOLS FOR PLANNING:
 - get_elements_by_category: Get all elements by category (params: category_name)
 - filter_elements: Advanced filtering (params: category_name, level_name, parameters)
 - get_element_properties: Get parameter values (params: element_ids, parameter_names)
-- update_element_parameters: Update parameters (params: updates)
+- update_element_parameters: Update parameters (params: updates OR element_ids + parameter_name + new_value)
 - select_elements_by_id: Select specific elements (params: element_ids)
 - select_stored_elements: Select stored elements (params: category_name)
 - list_stored_elements: List available stored categories (no params)
@@ -824,6 +890,61 @@ WORKFLOW EXAMPLES:
 Use plan_and_execute_workflow for multi-step operations to provide complete results in one response."""
         }
         
+        def execute_tool_call(tool_name, function_args):
+            """Execute a tool safely and return its result dictionary."""
+            normalized_args = function_args or {}
+            app.logger.info(f"Executing tool '{tool_name}' with args: {normalized_args}")
+
+            try:
+                if tool_name == REVIT_INFO_TOOL_NAME:
+                    tool_result_data = get_revit_project_info_mcp_tool()
+                elif tool_name == GET_ELEMENTS_BY_CATEGORY_TOOL_NAME:
+                    tool_result_data = get_elements_by_category_mcp_tool(category_name=normalized_args.get("category_name"))
+                elif tool_name == SELECT_ELEMENTS_TOOL_NAME:
+                    tool_result_data = select_elements_by_id_mcp_tool(element_ids=normalized_args.get("element_ids", []))
+                elif tool_name == SELECT_STORED_ELEMENTS_TOOL_NAME:
+                    tool_result_data = select_stored_elements_mcp_tool(category_name=normalized_args.get("category_name"))
+                elif tool_name == LIST_STORED_ELEMENTS_TOOL_NAME:
+                    tool_result_data = list_stored_elements_mcp_tool()
+                elif tool_name == FILTER_ELEMENTS_TOOL_NAME:
+                    tool_result_data = filter_elements_mcp_tool(
+                        category_name=normalized_args.get("category_name"),
+                        level_name=normalized_args.get("level_name"),
+                        parameters=normalized_args.get("parameters", [])
+                    )
+                elif tool_name == GET_ELEMENT_PROPERTIES_TOOL_NAME:
+                    tool_result_data = get_element_properties_mcp_tool(
+                        element_ids=normalized_args.get("element_ids", []),
+                        parameter_names=normalized_args.get("parameter_names", [])
+                    )
+                elif tool_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
+                    tool_result_data = update_element_parameters_mcp_tool(
+                        updates=normalized_args.get("updates"),
+                        element_ids=normalized_args.get("element_ids"),
+                        parameter_name=normalized_args.get("parameter_name"),
+                        new_value=normalized_args.get("new_value")
+                    )
+                elif tool_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
+                    tool_result_data = place_view_on_sheet_mcp_tool(
+                        view_name=normalized_args.get("view_name"),
+                        exact_match=normalized_args.get("exact_match", False)
+                    )
+                elif tool_name == LIST_VIEWS_TOOL_NAME:
+                    tool_result_data = list_views_mcp_tool()
+                elif tool_name == PLANNER_TOOL_NAME:
+                    tool_result_data = plan_and_execute_workflow_tool(
+                        user_request=normalized_args.get("user_request"),
+                        execution_plan=normalized_args.get("execution_plan", [])
+                    )
+                else:
+                    app.logger.warning(f"Unknown tool '{tool_name}' requested by LLM.")
+                    tool_result_data = {"status": "error", "message": f"Unknown tool '{tool_name}' requested by LLM."}
+            except Exception as tool_exc:
+                app.logger.error(f"Exception while executing tool '{tool_name}': {tool_exc}", exc_info=True)
+                tool_result_data = {"status": "error", "message": f"Exception while executing tool '{tool_name}': {tool_exc}"}
+
+            return tool_result_data
+
         final_response_to_frontend = {}
         image_output_for_frontend = None # To store image data if a tool returns it
         model_reply_text = "" # The final text reply from the LLM
@@ -836,216 +957,154 @@ Use plan_and_execute_workflow for multi-step operations to provide complete resu
             # --- OpenAI Models ---
             elif selected_model_ui_name.startswith('gpt-') or selected_model_ui_name.startswith('o3'):
                 client = openai.OpenAI(api_key=api_key)
-                # Add system prompt for planning
                 messages_for_llm = [planning_system_prompt] + [{"role": "assistant" if msg['role'] == 'bot' else msg['role'], "content": msg['content']} for msg in conversation_history]
-                
-                app.logger.debug(f"OpenAI: Sending messages: {messages_for_llm}")
-                completion = client.chat.completions.create(model=selected_model_ui_name, messages=messages_for_llm, tools=REVIT_TOOLS_SPEC_FOR_LLMS['openai'], tool_choice="auto")
-                response_message = completion.choices[0].message
-                tool_calls = response_message.tool_calls
+                max_tool_iterations = 5
+                iteration = 0
 
-                if tool_calls:
-                    messages_for_llm.append(response_message) # Add assistant's turn with tool_calls
-                    for tool_call in tool_calls:
-                        function_name = tool_call.function.name
-                        try:
-                            function_args = json.loads(tool_call.function.arguments)
-                        except json.JSONDecodeError as e:
-                            app.logger.error(f"OpenAI: Failed to parse function arguments for {function_name}: {tool_call.function.arguments}. Error: {e}")
-                            tool_response_content = json.dumps({"status": "error", "message": f"Invalid arguments from LLM for tool {function_name}."})
-                        else:
-                            app.logger.info(f"OpenAI: Tool call requested: {function_name} with args: {function_args}")
-                            tool_result_data = {}
-                            if function_name == REVIT_INFO_TOOL_NAME:
-                                tool_result_data = get_revit_project_info_mcp_tool()
-                            elif function_name == GET_ELEMENTS_BY_CATEGORY_TOOL_NAME:
-                                tool_result_data = get_elements_by_category_mcp_tool(category_name=function_args.get("category_name"))
-                            elif function_name == SELECT_ELEMENTS_TOOL_NAME:
-                                tool_result_data = select_elements_by_id_mcp_tool(element_ids=function_args.get("element_ids", []))
-                            elif function_name == SELECT_STORED_ELEMENTS_TOOL_NAME:
-                                tool_result_data = select_stored_elements_mcp_tool(category_name=function_args.get("category_name"))
-                            elif function_name == LIST_STORED_ELEMENTS_TOOL_NAME:
-                                tool_result_data = list_stored_elements_mcp_tool()
-                            elif function_name == FILTER_ELEMENTS_TOOL_NAME:
-                                tool_result_data = filter_elements_mcp_tool(category_name=function_args.get("category_name"), level_name=function_args.get("level_name"), parameters=function_args.get("parameters", []))
-                            elif function_name == GET_ELEMENT_PROPERTIES_TOOL_NAME:
-                                tool_result_data = get_element_properties_mcp_tool(element_ids=function_args.get("element_ids", []), parameter_names=function_args.get("parameter_names", []))
-                            elif function_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
-                                tool_result_data = update_element_parameters_mcp_tool(updates=function_args.get("updates", []))
-                            elif function_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
-                                tool_result_data = place_view_on_sheet_mcp_tool(view_name=function_args.get("view_name"), exact_match=function_args.get("exact_match", False))
-                            elif function_name == LIST_VIEWS_TOOL_NAME:
-                                tool_result_data = list_views_mcp_tool()
-                            elif function_name == PLANNER_TOOL_NAME:
-                                tool_result_data = plan_and_execute_workflow_tool(
-                                    user_request=function_args.get("user_request"),
-                                    execution_plan=function_args.get("execution_plan", [])
-                                )
+                while iteration < max_tool_iterations:
+                    iteration += 1
+                    app.logger.debug(f"OpenAI (iteration {iteration}): Sending messages: {messages_for_llm}")
+                    completion = client.chat.completions.create(
+                        model=selected_model_ui_name,
+                        messages=messages_for_llm,
+                        tools=REVIT_TOOLS_SPEC_FOR_LLMS['openai'],
+                        tool_choice="auto"
+                    )
+                    response_message = completion.choices[0].message
+                    messages_for_llm.append(response_message)
+                    tool_calls = response_message.tool_calls or []
+
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            function_name = tool_call.function.name
+                            try:
+                                raw_arguments = tool_call.function.arguments or "{}"
+                                function_args = json.loads(raw_arguments)
+                            except json.JSONDecodeError as e:
+                                app.logger.error(f"OpenAI: Failed to parse function arguments for {function_name}: {tool_call.function.arguments}. Error: {e}")
+                                tool_result_data = {"status": "error", "message": f"Invalid arguments from LLM for tool {function_name}."}
                             else:
-                                app.logger.warning(f"OpenAI: Unknown tool {function_name} called.")
-                                tool_result_data = {"status": "error", "message": f"Unknown tool '{function_name}' requested by LLM."}
-                            
-                            tool_response_content = json.dumps(tool_result_data)
-                        
-                        messages_for_llm.append({"tool_call_id": tool_call.id, "role": "tool", "name": function_name, "content": tool_response_content})
-                    
-                    app.logger.debug(f"OpenAI: Resending messages with tool results: {messages_for_llm}")
-                    second_completion = client.chat.completions.create(model=selected_model_ui_name, messages=messages_for_llm)
-                    model_reply_text = second_completion.choices[0].message.content
+                                tool_result_data = execute_tool_call(function_name, function_args)
+
+                            messages_for_llm.append({
+                                "tool_call_id": tool_call.id,
+                                "role": "tool",
+                                "name": function_name,
+                                "content": json.dumps(tool_result_data)
+                            })
+                        continue
+
+                    model_reply_text = response_message.content or ""
+                    break
                 else:
-                    model_reply_text = response_message.content
+                    app.logger.warning("OpenAI: Reached tool iteration limit without final response.")
+                    model_reply_text = "Reached tool execution limit without a final response."
 
             # --- Anthropic Models ---
             elif selected_model_ui_name.startswith('claude-'):
                 client = anthropic.Anthropic(api_key=api_key)
                 actual_anthropic_model_id = ANTHROPIC_MODEL_ID_MAP.get(selected_model_ui_name, selected_model_ui_name)
-                # Extract system prompt for separate parameter, don't include in messages  
                 system_prompt_content = planning_system_prompt["content"]
                 messages_for_llm = [{"role": "assistant" if msg['role'] == 'bot' else msg['role'], "content": msg['content']} for msg in conversation_history]
+                max_tool_iterations = 5
+                iteration = 0
 
-                app.logger.debug(f"Anthropic: Sending messages: {messages_for_llm}")
-                response = client.messages.create(
-                    model=actual_anthropic_model_id, 
-                    max_tokens=3000, 
-                    system=system_prompt_content,
-                    messages=messages_for_llm, 
-                    tools=REVIT_TOOLS_SPEC_FOR_LLMS['anthropic'], 
-                    tool_choice={"type": "auto"}
-                )
-                
-                if response.stop_reason == "tool_use":
-                    messages_for_llm.append({"role": "assistant", "content": response.content}) # Add assistant's turn
-                    tool_results_for_anthropic_user_turn = []
-
-                    for tool_use_block in response.content:
-                        if tool_use_block.type == 'tool_use':
-                            tool_name = tool_use_block.name
-                            tool_input = tool_use_block.input
-                            tool_use_id = tool_use_block.id
-                            app.logger.info(f"Anthropic: Tool use requested: {tool_name}, Input: {tool_input}, ID: {tool_use_id}")
-                            
-                            tool_result_data = {}
-                            if tool_name == REVIT_INFO_TOOL_NAME:
-                                tool_result_data = get_revit_project_info_mcp_tool()
-                            elif tool_name == GET_ELEMENTS_BY_CATEGORY_TOOL_NAME:
-                                tool_result_data = get_elements_by_category_mcp_tool(category_name=tool_input.get("category_name"))
-                            elif tool_name == SELECT_ELEMENTS_TOOL_NAME:
-                                tool_result_data = select_elements_by_id_mcp_tool(element_ids=tool_input.get("element_ids", []))
-                            elif tool_name == SELECT_STORED_ELEMENTS_TOOL_NAME:
-                                tool_result_data = select_stored_elements_mcp_tool(category_name=tool_input.get("category_name"))
-                            elif tool_name == LIST_STORED_ELEMENTS_TOOL_NAME:
-                                tool_result_data = list_stored_elements_mcp_tool()
-                            elif tool_name == FILTER_ELEMENTS_TOOL_NAME:
-                                tool_result_data = filter_elements_mcp_tool(category_name=tool_input.get("category_name"), level_name=tool_input.get("level_name"), parameters=tool_input.get("parameters", []))
-                            elif tool_name == GET_ELEMENT_PROPERTIES_TOOL_NAME:
-                                tool_result_data = get_element_properties_mcp_tool(element_ids=tool_input.get("element_ids", []), parameter_names=tool_input.get("parameter_names", []))
-                            elif tool_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
-                                tool_result_data = update_element_parameters_mcp_tool(updates=tool_input.get("updates", []))
-                            elif tool_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
-                                tool_result_data = place_view_on_sheet_mcp_tool(view_name=tool_input.get("view_name"), exact_match=tool_input.get("exact_match", False))
-                            elif tool_name == LIST_VIEWS_TOOL_NAME:
-                                tool_result_data = list_views_mcp_tool()
-                            elif tool_name == PLANNER_TOOL_NAME:
-                                tool_result_data = plan_and_execute_workflow_tool(
-                                    user_request=tool_input.get("user_request"),
-                                    execution_plan=tool_input.get("execution_plan", [])
-                                )
-                            else:
-                                app.logger.warning(f"Anthropic: Unknown tool {tool_name} called.")
-                                tool_result_data = {"status": "error", "message": f"Unknown tool '{tool_name}' requested by LLM."}
-
-                            tool_results_for_anthropic_user_turn.append({
-                                "type": "tool_result", 
-                                "tool_use_id": tool_use_id, 
-                                "content": json.dumps(tool_result_data) # Anthropic expects content to be string or list of blocks
-                            })
-                    
-                    messages_for_llm.append({"role": "user", "content": tool_results_for_anthropic_user_turn})
-                    
-                    app.logger.debug(f"Anthropic: Resending messages with tool results: {messages_for_llm}")
-                    second_response = client.messages.create(
-                        model=actual_anthropic_model_id, 
-                        max_tokens=3000, 
+                while iteration < max_tool_iterations:
+                    iteration += 1
+                    app.logger.debug(f"Anthropic (iteration {iteration}): Sending messages: {messages_for_llm}")
+                    response = client.messages.create(
+                        model=actual_anthropic_model_id,
+                        max_tokens=3000,
                         system=system_prompt_content,
-                        messages=messages_for_llm
+                        messages=messages_for_llm,
+                        tools=REVIT_TOOLS_SPEC_FOR_LLMS['anthropic'],
+                        tool_choice={"type": "auto"}
                     )
-                    if second_response.content and second_response.content[0].type == "text":
-                        model_reply_text = second_response.content[0].text
-                    else: model_reply_text = "Anthropic model responded with non-text content after tool use."
-                elif response.content and response.content[0].type == "text":
-                    model_reply_text = response.content[0].text
-                else: model_reply_text = "Anthropic model returned an unexpected response type."
-            
+                    messages_for_llm.append({"role": "assistant", "content": response.content})
+
+                    tool_results_for_turn = []
+                    for response_block in response.content:
+                        if getattr(response_block, 'type', None) == 'tool_use':
+                            tool_name = response_block.name
+                            function_args = response_block.input if isinstance(response_block.input, dict) else {}
+                            app.logger.info(f"Anthropic: Tool use requested: {tool_name}, Input: {function_args}")
+                            tool_result_data = execute_tool_call(tool_name, function_args)
+                            tool_results_for_turn.append({
+                                "type": "tool_result",
+                                "tool_use_id": response_block.id,
+                                "content": json.dumps(tool_result_data)
+                            })
+
+                    if tool_results_for_turn:
+                        messages_for_llm.append({"role": "user", "content": tool_results_for_turn})
+                        continue
+
+                    text_parts = [block.text for block in response.content if getattr(block, 'type', None) == 'text' and getattr(block, 'text', None)]
+                    if text_parts:
+                        model_reply_text = ''.join(text_parts)
+                    else:
+                        model_reply_text = "Anthropic model responded without text content after tool execution."
+                    break
+                else:
+                    app.logger.warning("Anthropic: Reached tool iteration limit without final response.")
+                    model_reply_text = "Reached tool execution limit without a final response."
+
             # --- Google Gemini Models ---
             elif selected_model_ui_name.startswith('gemini-'):
                 genai.configure(api_key=api_key)
-                # Gemini requires a specific tool configuration for its API
                 gemini_tool_config = google_types.ToolConfig(
                     function_calling_config=google_types.FunctionCallingConfig(
                         mode=google_types.FunctionCallingConfig.Mode.AUTO
                     )
                 )
-                model = genai.GenerativeModel(selected_model_ui_name, tools=REVIT_TOOLS_SPEC_FOR_LLMS['google'], tool_config=gemini_tool_config, system_instruction=planning_system_prompt["content"])
-                
+                model = genai.GenerativeModel(
+                    selected_model_ui_name,
+                    tools=REVIT_TOOLS_SPEC_FOR_LLMS['google'],
+                    tool_config=gemini_tool_config,
+                    system_instruction=planning_system_prompt["content"]
+                )
+
                 gemini_history_for_chat = []
                 for msg in conversation_history:
                     role = 'user' if msg['role'] == 'user' else 'model'
-                    gemini_history_for_chat.append({'role': role, 'parts': [google_types.Part(text=msg['content'])]}) # Basic text parts
-                
-                # The last message is the current user prompt
-                current_user_prompt_parts = gemini_history_for_chat.pop()['parts']
+                    gemini_history_for_chat.append({'role': role, 'parts': [google_types.Part(text=msg['content'])]})
+
+                if gemini_history_for_chat:
+                    current_user_prompt_parts = gemini_history_for_chat.pop()['parts']
+                else:
+                    current_user_prompt_parts = [google_types.Part(text=conversation_history[-1]['content'])]
 
                 chat_session = model.start_chat(history=gemini_history_for_chat)
                 app.logger.debug(f"Google: Sending prompt parts: {current_user_prompt_parts} with history count: {len(chat_session.history)}")
 
                 gemini_response = chat_session.send_message(current_user_prompt_parts)
-                
-                # Check for function call
-                candidate = gemini_response.candidates[0]
-                if candidate.content.parts and candidate.content.parts[0].function_call:
-                    function_call = candidate.content.parts[0].function_call
-                    function_name = function_call.name
-                    function_args = dict(function_call.args)
-                    app.logger.info(f"Google: Function call requested: {function_name} with args {function_args}")
+                max_tool_iterations = 5
 
-                    tool_result_data = {}
-                    if function_name == REVIT_INFO_TOOL_NAME:
-                        tool_result_data = get_revit_project_info_mcp_tool()
-                    elif function_name == GET_ELEMENTS_BY_CATEGORY_TOOL_NAME:
-                        tool_result_data = get_elements_by_category_mcp_tool(category_name=function_args.get("category_name"))
-                    elif function_name == SELECT_ELEMENTS_TOOL_NAME:
-                        tool_result_data = select_elements_by_id_mcp_tool(element_ids=function_args.get("element_ids", []))
-                    elif function_name == SELECT_STORED_ELEMENTS_TOOL_NAME:
-                        tool_result_data = select_stored_elements_mcp_tool(category_name=function_args.get("category_name"))
-                    elif function_name == LIST_STORED_ELEMENTS_TOOL_NAME:
-                        tool_result_data = list_stored_elements_mcp_tool()
-                    elif function_name == FILTER_ELEMENTS_TOOL_NAME:
-                        tool_result_data = filter_elements_mcp_tool(category_name=function_args.get("category_name"), level_name=function_args.get("level_name"), parameters=function_args.get("parameters", []))
-                    elif function_name == GET_ELEMENT_PROPERTIES_TOOL_NAME:
-                        tool_result_data = get_element_properties_mcp_tool(element_ids=function_args.get("element_ids", []), parameter_names=function_args.get("parameter_names", []))
-                    elif function_name == UPDATE_ELEMENT_PARAMETERS_TOOL_NAME:
-                        tool_result_data = update_element_parameters_mcp_tool(updates=function_args.get("updates", []))
-                    elif function_name == PLACE_VIEW_ON_SHEET_TOOL_NAME:
-                        tool_result_data = place_view_on_sheet_mcp_tool(view_name=function_args.get("view_name"), exact_match=function_args.get("exact_match", False))
-                    elif function_name == LIST_VIEWS_TOOL_NAME:
-                        tool_result_data = list_views_mcp_tool()
-                    elif function_name == PLANNER_TOOL_NAME:
-                        tool_result_data = plan_and_execute_workflow_tool(
-                            user_request=function_args.get("user_request"),
-                            execution_plan=function_args.get("execution_plan", [])
+                for iteration in range(1, max_tool_iterations + 1):
+                    candidate = gemini_response.candidates[0]
+                    function_part = next((part for part in candidate.content.parts if getattr(part, 'function_call', None)), None)
+
+                    if function_part:
+                        function_name = function_part.function_call.name
+                        function_args = dict(function_part.function_call.args)
+                        app.logger.info(f"Google: Function call requested: {function_name} with args {function_args}")
+                        tool_result_data = execute_tool_call(function_name, function_args)
+                        function_response_part = google_types.Part(
+                            function_response=google_types.FunctionResponse(
+                                name=function_name,
+                                response=tool_result_data
+                            )
                         )
-                    else:
-                        app.logger.warning(f"Google: Unknown tool {function_name} called.")
-                        tool_result_data = {"status": "error", "message": f"Unknown tool '{function_name}' requested by LLM."}
+                        app.logger.debug(f"Google: Resending with tool response for iteration {iteration}.")
+                        gemini_response = chat_session.send_message([function_response_part])
+                        continue
 
-                    function_response_part = google_types.Part(
-                        function_response=google_types.FunctionResponse(name=function_name, response=tool_result_data)
-                    )
-                    app.logger.debug(f"Google: Resending with tool response: {function_response_part}")
-                    gemini_response_after_tool = chat_session.send_message(function_response_part)
-                    model_reply_text = gemini_response_after_tool.text
+                    text_output = ''.join(part.text for part in candidate.content.parts if getattr(part, 'text', None))
+                    model_reply_text = text_output or gemini_response.text
+                    break
                 else:
-                    model_reply_text = gemini_response.text
+                    app.logger.warning("Google: Reached tool iteration limit without final response.")
+                    model_reply_text = "Reached tool execution limit without a final response."
             else:
                 error_message_for_frontend = f"Model '{selected_model_ui_name}' is not recognized or supported."
 
